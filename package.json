@@ -1,0 +1,15 @@
+{
+  "name": "blessed-contracts-cairo",
+  "version": "0.0.1",
+  "description": "Blessed.fan",
+  "main": "index.js",
+  "scripts": {
+    "compile-watch": "nodemon --ext cairo --exec \"scarb build\"",
+    "copy-artifacts": "chmod +x copy-artifacts-to-app.sh && ./copy-artifacts-to-app.sh"
+  },
+  "author": "@adiusz",
+  "license": "MIT",
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  }
+}
