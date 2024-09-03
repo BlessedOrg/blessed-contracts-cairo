@@ -4,15 +4,18 @@ mod ERC1155EventTicket {
     #[starknet::interface]
     trait IERC20<TContractState> {
         fn approve(ref self: TContractState, spender: ContractAddress, amount: u256);
-        fn transferFrom(ref self: TContractState, sender: ContractAddress, recipient: ContractAddress, amount: u256);
+        fn transferFrom( ref self: TContractState, sender: ContractAddress, recipient: ContractAddress, amount: u256);
+        fn balance_of(ref self: TContractState, owner: ContractAddress) -> u256;
     }
     impl IERC20Impl of IERC20<ContractAddress> {
         fn approve(ref self: ContractAddress, spender: ContractAddress, amount: u256) {
             IERC20Dispatcher { contract_address: self }.approve(spender, amount);
         }
-
         fn transferFrom(ref self: ContractAddress, sender: ContractAddress, recipient: ContractAddress, amount: u256) {
             IERC20Dispatcher { contract_address: self }.transferFrom(sender, recipient, amount);
+        }
+        fn balance_of(ref self: ContractAddress, owner: ContractAddress) -> u256 {
+            IERC20Dispatcher { contract_address: self }.balance_of(owner)
         }
     }
     use openzeppelin::access::ownable::OwnableComponent;
@@ -56,21 +59,21 @@ mod ERC1155EventTicket {
             to: ContractAddress,
             token_ids: Span<u256>,
             values: Span<u256>,
-        ) {
-        }
+        ) {}
     }
 
     // 🥩 Actual Contract's logic
     #[storage]
     struct Storage {
-        ticket_price: u256,
-        total_supply: u256,
-        seller: ContractAddress,
-        contract_balance: u256,
-        listed_tokens: LegacyMap<ContractAddress, (u256, u256)>,
-        royalties: u256,
-        erc20_address: ContractAddress,
-
+        pub ticket_price: u256,
+        pub total_supply: u256,
+        pub seller: ContractAddress,
+        pub contract_balance: u256,
+        pub listed_tokens: LegacyMap<ContractAddress, (u256, u256)>,
+        pub royalties: u8,
+        pub erc20_address: ContractAddress,
+        pub event_type: u8,
+        pub next_token_id: u256,
         #[substorage(v0)]
         erc1155: ERC1155Component::Storage,
         #[substorage(v0)]
@@ -79,6 +82,13 @@ mod ERC1155EventTicket {
         pausable: PausableComponent::Storage,
         #[substorage(v0)]
         ownable: OwnableComponent::Storage,
+    }
+
+    #[derive(Drop)]
+    enum EventType {
+        free, // event_type_integer_value = 1
+        refundable, // event_type_integer_value = 2
+        paid, // event_type_integer_value = 3
     }
 
     #[derive(Drop)]
@@ -108,35 +118,91 @@ mod ERC1155EventTicket {
         ticket_price: u256,
         total_supply: u256,
         seller: ContractAddress,
-        royalties: u256,
+        royalties: u8,
         erc20_address: ContractAddress,
+        event_type_integer_value: u8
     ) {
         assert(1 <= royalties && royalties <= 99, 4); // Error code 4: Invalid royalties percentage
-
+        assert(
+          event_type_integer_value == 1 || event_type_integer_value == 2 || event_type_integer_value == 3,
+          5 // Error code 5: Wrong event type. 1 - free, 2 - refundable, 3 - paid
+        );
+        self.next_token_id.write(1);
         self.ticket_price.write(ticket_price);
         self.total_supply.write(total_supply);
         self.seller.write(seller);
         self.contract_balance.write(total_supply);
         self.royalties.write(royalties);
         self.erc20_address.write(erc20_address);
-
+        self.event_type.write(event_type_integer_value);
         self.erc1155.initializer("");
         self.ownable.initializer(owner);
     }
 
+    #[generate_trait]
+    #[abi(per_item)]
+    impl ExternalImpl of ExternalTrait {
+        #[external(v0)]
+        fn mint(
+            ref self: ContractState,
+            account: ContractAddress,
+            token_id: u256,
+            value: u256,
+            data: Span<felt252>,
+        ) {
+            self.erc1155.mint_with_acceptance_check(account, token_id, value, data);
+        }
+
+        #[external(v0)]
+        fn batch_mint(
+            ref self: ContractState,
+            account: ContractAddress,
+            token_ids: Span<u256>,
+            values: Span<u256>,
+            data: Span<felt252>,
+        ) {
+            self.ownable.assert_only_owner();
+            self.erc1155.batch_mint_with_acceptance_check(account, token_ids, values, data);
+        }
+
+        #[external(v0)]
+        fn batchMint(
+            ref self: ContractState,
+            account: ContractAddress,
+            tokenIds: Span<u256>,
+            values: Span<u256>,
+            data: Span<felt252>,
+        ) {
+            self.batch_mint(account, tokenIds, values, data);
+        }
+    }
 
     #[external(v0)]
-    fn mint(ref self: ContractState, amount: u256) {
+    fn get_ticket(ref self: ContractState) {
         let caller = get_caller_address();
-        let seller = self.seller.read();
+        let mut erc20_address = self.erc20_address.read();
+        let caller_balance = IERC20::balance_of(ref erc20_address, caller);
+        assert(caller_balance >= self.ticket_price.read(), 7);
+        IERC20::transferFrom(ref erc20_address, caller, self.ownable.owner(), 100);
+        let current_token_id = self.next_token_id.read();
+        self.mint(caller, current_token_id, 1, ArrayTrait::new().span());
+        self.next_token_id.write(current_token_id + 1);
+    }
 
-        assert(caller == seller, 1); // Error code 1: Unauthorized minting
+    fn u8_to_event_type(value: u8) -> EventType {
+        match value {
+            0 => EventType::free,
+            1 => EventType::refundable,
+            2 => EventType::paid,
+            _ => panic!("Invalid value for EventType"),
+        }
+    }
 
-        let current_supply = self.total_supply.read();
-        self.total_supply.write(current_supply + amount);
-
-        let current_contract_balance = self.contract_balance.read();
-        self.contract_balance.write(current_contract_balance + amount);
+    #[external(v0)]
+    fn get_event_type(ref self: ContractState) -> u8 {
+        let value = self.event_type.read();
+        // 1 - free, 2 - refundable, 3 - paid
+        value
     }
 
     #[external(v0)]
@@ -198,21 +264,26 @@ mod ERC1155EventTicket {
 
         // Calculate the royalties amount
         let royalties_percentage = self.royalties.read();
-        let royalties_amount = (price * royalties_percentage) / 100;
+        let royalties_amount = (price * royalties_percentage.into()) / 100_u256;
 
-        // Approve the contract to spend the buyer's tokens
-        IERC20::approve(ref erc20_address, starknet::get_contract_address(), price);
+        // 🏗️ TODO: move it to the seperate function to safely call transferFrom | Approve the
+        // contract to spend the buyer's tokens IERC20::approve(ref erc20_address,
+        // starknet::get_contract_address(), price);
 
         // Transfer the token price from the buyer to the contract
-        IERC20::transferFrom(ref erc20_address, buyer, starknet::get_contract_address(), price);
+        IERC20::transferFrom(ref erc20_address, buyer, seller, price);
 
         // Transfer the royalties to the contract owner
         let owner = self.ownable.owner();
-        IERC20::transferFrom(ref erc20_address, starknet::get_contract_address(), owner, royalties_amount);
+        IERC20::transferFrom(
+            ref erc20_address, starknet::get_contract_address(), owner, royalties_amount
+        );
 
         // Transfer the remaining amount to the seller
         let seller_amount = price - royalties_amount;
-        IERC20::transferFrom(ref erc20_address, starknet::get_contract_address(), seller, seller_amount);
+        IERC20::transferFrom(
+            ref erc20_address, starknet::get_contract_address(), seller, seller_amount
+        );
 
         // Transfer the token to the buyer
         self.erc1155.safe_transfer_from(seller, buyer, token_id, 1, ArrayTrait::new().span());
@@ -222,34 +293,33 @@ mod ERC1155EventTicket {
     }
 
     #[external(v0)]
-    fn get_erc20_contract_address(ref self: ContractState) -> ContractAddress {
+    fn get_erc20_contract_address(self: @ContractState) -> ContractAddress {
         self.erc20_address.read()
     }
 
     #[external(v0)]
-    fn get_ticket_price(ref self: ContractState) -> u256 {
-      self.ticket_price.read()
+    fn get_ticket_price(self: @ContractState) -> u256 {
+        self.ticket_price.read()
     }
 
     #[external(v0)]
-    fn get_total_supply(ref self: ContractState) -> u256 {
-      self.total_supply.read()
+    fn get_total_supply(self: @ContractState) -> u256 {
+        self.total_supply.read()
     }
 
     #[external(v0)]
-    fn get_seller(ref self: ContractState) -> ContractAddress {
-      self.seller.read()
+    fn get_seller(self: @ContractState) -> ContractAddress {
+        self.seller.read()
     }
 
     #[external(v0)]
-    fn get_contract_balance(ref self: ContractState) -> u256 {
-      self.contract_balance.read()
+    fn get_contract_balance(self: @ContractState) -> u256 {
+        self.contract_balance.read()
     }
 
     #[external(v0)]
-    fn get_royalties(ref self: ContractState) -> u256 {
-      self.royalties.read()
+    fn get_royalties(self: @ContractState) -> u8 {
+        self.royalties.read()
     }
-
     // add getter for specified listing
 }
