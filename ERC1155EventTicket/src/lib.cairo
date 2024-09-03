@@ -74,6 +74,7 @@ mod ERC1155EventTicket {
         pub erc20_address: ContractAddress,
         pub event_type: u8,
         pub next_token_id: u256,
+        pub ticket_balances: LegacyMap<ContractAddress, u256>,
         #[substorage(v0)]
         erc1155: ERC1155Component::Storage,
         #[substorage(v0)]
@@ -153,6 +154,13 @@ mod ERC1155EventTicket {
             self.erc1155.mint_with_acceptance_check(account, token_id, value, data);
         }
 
+        fn mint_ticket(ref self: ContractState, recipient: ContractAddress) {
+            self.ticket_balances.write(recipient, 1);
+            let current_token_id = self.next_token_id.read();
+            self.mint(recipient, current_token_id, 1, ArrayTrait::new().span());
+            self.next_token_id.write(current_token_id + 1);
+        }
+
         #[external(v0)]
         fn batch_mint(
             ref self: ContractState,
@@ -181,12 +189,20 @@ mod ERC1155EventTicket {
     fn get_ticket(ref self: ContractState) {
         let caller = get_caller_address();
         let mut erc20_address = self.erc20_address.read();
+        let event_type = self.event_type.read();
         let caller_balance = IERC20::balance_of(ref erc20_address, caller);
-        assert(caller_balance >= self.ticket_price.read(), 7);
-        IERC20::transferFrom(ref erc20_address, caller, self.ownable.owner(), 100);
-        let current_token_id = self.next_token_id.read();
-        self.mint(caller, current_token_id, 1, ArrayTrait::new().span());
-        self.next_token_id.write(current_token_id + 1);
+
+         if event_type == 1 {
+            let current_balance = self.ticket_balances.read(caller);
+            assert(current_balance == 0, 7);
+            self.mint_ticket(caller);
+        } else if event_type == 2 || event_type == 3 {
+            assert(caller_balance >= self.ticket_price.read(), 8);
+            let current_balance = self.ticket_balances.read(caller);
+            assert(current_balance == 0, 7);
+            IERC20::transferFrom(ref erc20_address, caller, self.ownable.owner(), self.ticket_price.read());
+            self.mint_ticket(caller);
+        }
     }
 
     fn u8_to_event_type(value: u8) -> EventType {
@@ -196,13 +212,6 @@ mod ERC1155EventTicket {
             2 => EventType::paid,
             _ => panic!("Invalid value for EventType"),
         }
-    }
-
-    #[external(v0)]
-    fn get_event_type(ref self: ContractState) -> u8 {
-        let value = self.event_type.read();
-        // 1 - free, 2 - refundable, 3 - paid
-        value
     }
 
     #[external(v0)]
@@ -293,6 +302,13 @@ mod ERC1155EventTicket {
     }
 
     #[external(v0)]
+    fn get_event_type(self: @ContractState) -> u8 {
+        let value = self.event_type.read();
+        // 1 - free, 2 - refundable, 3 - paid
+        value
+    }
+
+    #[external(v0)]
     fn get_erc20_contract_address(self: @ContractState) -> ContractAddress {
         self.erc20_address.read()
     }
@@ -320,6 +336,16 @@ mod ERC1155EventTicket {
     #[external(v0)]
     fn get_royalties(self: @ContractState) -> u8 {
         self.royalties.read()
+    }
+
+    #[external(v0)]
+    fn get_caller_balance(self: @ContractState) -> u256 {
+        self.ticket_balances.read(get_caller_address())
+    }
+
+    #[external(v0)]
+    fn get_wallet_balance(self: @ContractState, wallet: ContractAddress) -> u256 {
+        self.ticket_balances.read(wallet)
     }
     // add getter for specified listing
 }
