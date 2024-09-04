@@ -5,7 +5,9 @@ mod ERC1155EventTicket {
     trait IERC20<TContractState> {
         fn approve(ref self: TContractState, spender: ContractAddress, amount: u256);
         fn transferFrom( ref self: TContractState, sender: ContractAddress, recipient: ContractAddress, amount: u256);
-        fn balance_of(ref self: TContractState, owner: ContractAddress) -> u256;
+        fn balance_of(self: @TContractState, owner: ContractAddress) -> u256;
+        fn allowance(self: @TContractState, owner: ContractAddress, spender: ContractAddress) -> u256;
+
     }
     impl IERC20Impl of IERC20<ContractAddress> {
         fn approve(ref self: ContractAddress, spender: ContractAddress, amount: u256) {
@@ -14,8 +16,11 @@ mod ERC1155EventTicket {
         fn transferFrom(ref self: ContractAddress, sender: ContractAddress, recipient: ContractAddress, amount: u256) {
             IERC20Dispatcher { contract_address: self }.transferFrom(sender, recipient, amount);
         }
-        fn balance_of(ref self: ContractAddress, owner: ContractAddress) -> u256 {
-            IERC20Dispatcher { contract_address: self }.balance_of(owner)
+				fn balance_of(self: @ContractAddress, owner: ContractAddress) -> u256 {
+            IERC20Dispatcher { contract_address: *self }.balance_of(owner)
+        }
+        fn allowance(self: @ContractAddress, owner: ContractAddress, spender: ContractAddress) -> u256 {
+            IERC20Dispatcher { contract_address: *self }.allowance(owner, spender)
         }
     }
     use openzeppelin::access::ownable::OwnableComponent;
@@ -188,21 +193,34 @@ mod ERC1155EventTicket {
     #[external(v0)]
     fn get_ticket(ref self: ContractState) {
         let caller = get_caller_address();
-        let mut erc20_address = self.erc20_address.read();
         let event_type = self.event_type.read();
-        let caller_balance = IERC20::balance_of(ref erc20_address, caller);
 
          if event_type == 1 {
             let current_balance = self.ticket_balances.read(caller);
             assert(current_balance == 0, 7);
             self.mint_ticket(caller);
         } else if event_type == 2 || event_type == 3 {
+            let mut erc20_address = self.erc20_address.read();
+            let caller_balance = IERC20::balance_of(@erc20_address, caller);
             assert(caller_balance >= self.ticket_price.read(), 8);
             let current_balance = self.ticket_balances.read(caller);
             assert(current_balance == 0, 7);
+            let allowed_amount = IERC20::allowance(@erc20_address, caller, starknet::get_contract_address());
+            assert(allowed_amount >= self.ticket_price.read(), 9); // Error code 9: Insufficient allowance
             IERC20::transferFrom(ref erc20_address, caller, self.ownable.owner(), self.ticket_price.read());
             self.mint_ticket(caller);
         }
+    }
+
+    #[external(v0)]
+    fn refund(ref self: ContractState) {
+        let caller = get_caller_address();
+        let event_type = self.event_type.read();
+        if event_type == 2 {
+
+        }
+        let mut array: Array<felt252> = ArrayTrait::new();
+        let span = array.span();
     }
 
     fn u8_to_event_type(value: u8) -> EventType {
