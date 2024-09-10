@@ -4,7 +4,7 @@ mod ERC1155EventTicket {
     #[starknet::interface]
     trait IERC20<TContractState> {
         fn approve(ref self: TContractState, spender: ContractAddress, amount: u256);
-        fn transferFrom( ref self: TContractState, sender: ContractAddress, recipient: ContractAddress, amount: u256);
+        fn transferFrom(ref self: TContractState, sender: ContractAddress, recipient: ContractAddress, amount: u256);
         fn balance_of(self: @TContractState, owner: ContractAddress) -> u256;
         fn allowance(self: @TContractState, owner: ContractAddress, spender: ContractAddress) -> u256;
 
@@ -91,7 +91,7 @@ mod ERC1155EventTicket {
         ownable: OwnableComponent::Storage,
     }
 
-		#[derive(Copy, Drop, Serde, starknet::Store)]
+		#[derive(Copy, Drop, Serde, starknet::Store, PartialEq)]
 		 enum EventType {
 		     Free,
 		     Refundable,
@@ -156,6 +156,14 @@ mod ERC1155EventTicket {
         self.erc20_address.write(erc20_address);
         self.erc1155.initializer("");
         self.ownable.initializer(owner);
+
+        let total_approval_amount = self.ticket_price.read() * self.ticket_supply.read();
+        let mut erc20_address = self.erc20_address.read();
+        IERC20::approve(
+            ref erc20_address,
+            starknet::get_contract_address(),
+            total_approval_amount
+        );
     }
 
     #[generate_trait]
@@ -203,6 +211,7 @@ mod ERC1155EventTicket {
         }
     }
 
+		#[external(v0)]
     fn get_ticket(ref self: ContractState) {
         let caller = get_caller_address();
         let ticket_type = self.ticket_type.read();
@@ -219,7 +228,7 @@ mod ERC1155EventTicket {
                 assert(caller_balance >= self.ticket_price.read(), 'Insufficient balance');
                 let allowed_amount = IERC20::allowance(@erc20_address, caller, starknet::get_contract_address());
                 assert(allowed_amount >= self.ticket_price.read(), 'Insufficient allowance');
-                IERC20::transferFrom(ref erc20_address, caller, self.ownable.owner(), self.ticket_price.read());
+                IERC20::transferFrom(ref erc20_address, caller, starknet::get_contract_address(), self.ticket_price.read());
                 self.mint_ticket(caller);
             },
         }
@@ -244,17 +253,17 @@ mod ERC1155EventTicket {
         let ticket_type = self.ticket_type.read();
         match ticket_type {
             EventType::Refundable => {
-                assert(get_block_timestamp() > self.event_end.read(), 'Event has not ended yet');
-	                  let caller = get_caller_address();
-	                  let ticket_balance = self.ticket_balances.read(caller);
-	                  assert(ticket_balance > 0, 'No ticket to refund');
+                // assert(get_block_timestamp() > self.event_end.read(), 'Event has not ended yet');
+                let caller = get_caller_address();
+                let ticket_balance = self.ticket_balances.read(caller);
+                assert(ticket_balance > 0, 'No ticket to refund');
 
-	                  let ticket_price = self.ticket_price.read();
-	                  let mut erc20_address = self.erc20_address.read();
+                let ticket_price = self.ticket_price.read();
+                let mut erc20_address = self.erc20_address.read();
 
-	                  IERC20::transferFrom(ref erc20_address, self.ownable.owner(), caller, ticket_price);
-	                  // Emit a refund event (you'll need to define this event)
-	                  // self.emit(RefundEvent { user: caller, amount: ticket_price });
+                IERC20::transferFrom(ref erc20_address, starknet::get_contract_address(), caller, ticket_price);
+                // Emit a refund event (you'll need to define this event)
+                // self.emit(RefundEvent { user: caller, amount: ticket_price });
             },
             EventType::Free | EventType::Paid => {
                let mut error_msg = ArrayTrait::new();
