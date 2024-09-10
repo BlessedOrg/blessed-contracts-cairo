@@ -4,7 +4,7 @@
   "description": "Blessed.fan",
   "main": "index.js",
   "scripts": {
-    "compile-watch": "nodemon --ext cairo --exec \"scarb build\"",
+    "compile-watch": "nodemon --ext cairo --exec \"scarb clean && scarb build && ls -a\"",
     "copy-artifacts": "chmod +x copy-artifacts-to-app.sh && ./copy-artifacts-to-app.sh"
   },
   "author": "@adiusz",
