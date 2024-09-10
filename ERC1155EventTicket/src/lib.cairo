@@ -29,6 +29,7 @@ mod ERC1155EventTicket {
     use openzeppelin::token::erc1155::ERC1155Component;
     use starknet::ContractAddress;
     use starknet::get_caller_address;
+    use starknet::get_block_timestamp;
 
     component!(path: ERC1155Component, storage: erc1155, event: ERC1155Event);
     component!(path: SRC5Component, storage: src5, event: SRC5Event);
@@ -71,15 +72,15 @@ mod ERC1155EventTicket {
     #[storage]
     struct Storage {
         pub ticket_price: u256,
-        pub total_supply: u256,
-        pub seller: ContractAddress,
-        pub contract_balance: u256,
-        pub listed_tokens: LegacyMap<ContractAddress, (u256, u256)>,
+        pub ticket_balances: LegacyMap<ContractAddress, u256>,
+        pub ticket_type: EventType,
+        pub ticket_supply: u256,
+        pub ticket_listings: LegacyMap<ContractAddress, (u256, u256)>,
         pub royalties: u8,
         pub erc20_address: ContractAddress,
-        pub event_type: u8,
         pub next_token_id: u256,
-        pub ticket_balances: LegacyMap<ContractAddress, u256>,
+        pub event_start: u64,
+        pub event_end: u64,
         #[substorage(v0)]
         erc1155: ERC1155Component::Storage,
         #[substorage(v0)]
@@ -90,12 +91,12 @@ mod ERC1155EventTicket {
         ownable: OwnableComponent::Storage,
     }
 
-    #[derive(Drop)]
-    enum EventType {
-        free, // event_type_integer_value = 1
-        refundable, // event_type_integer_value = 2
-        paid, // event_type_integer_value = 3
-    }
+		#[derive(Copy, Drop, Serde, starknet::Store)]
+		 enum EventType {
+		     Free,
+		     Refundable,
+		     Paid,
+		 }
 
     #[derive(Drop)]
     struct Listing {
@@ -122,25 +123,37 @@ mod ERC1155EventTicket {
         ref self: ContractState,
         owner: ContractAddress,
         ticket_price: u256,
-        total_supply: u256,
-        seller: ContractAddress,
+        ticket_supply: u256,
         royalties: u8,
         erc20_address: ContractAddress,
-        event_type_integer_value: u8
+        ticket_type: felt252,
+        event_start: u64,
+        event_end: u64,
     ) {
         assert(1 <= royalties && royalties <= 99, 4); // Error code 4: Invalid royalties percentage
-        assert(
-          event_type_integer_value == 1 || event_type_integer_value == 2 || event_type_integer_value == 3,
-          5 // Error code 5: Wrong event type. 1 - free, 2 - refundable, 3 - paid
-        );
+        assert(event_start > get_block_timestamp(), 'event_start < now');
+        assert(event_end > event_start, 'event_end < event_start');
+
+        let ticket_type_value =
+        if ticket_type == 'free' {
+            EventType::Free
+        } else if ticket_type == 'refundable' {
+            EventType::Refundable
+        } else if ticket_type == 'paid' {
+            EventType::Paid
+        } else {
+            let mut error_msg = ArrayTrait::new();
+            error_msg.append('free | refundable | paid');
+            panic(error_msg)
+        };
+        self.ticket_type.write(ticket_type_value);
+        self.event_start.write(event_start);
+        self.event_end.write(event_end);
         self.next_token_id.write(1);
         self.ticket_price.write(ticket_price);
-        self.total_supply.write(total_supply);
-        self.seller.write(seller);
-        self.contract_balance.write(total_supply);
+        self.ticket_supply.write(ticket_supply);
         self.royalties.write(royalties);
         self.erc20_address.write(erc20_address);
-        self.event_type.write(event_type_integer_value);
         self.erc1155.initializer("");
         self.ownable.initializer(owner);
     }
@@ -190,46 +203,59 @@ mod ERC1155EventTicket {
         }
     }
 
-    #[external(v0)]
     fn get_ticket(ref self: ContractState) {
         let caller = get_caller_address();
-        let event_type = self.event_type.read();
+        let ticket_type = self.ticket_type.read();
+        let current_balance = self.ticket_balances.read(caller);
+        assert(current_balance == 0, 'Already has a ticket');
 
-         if event_type == 1 {
-            let current_balance = self.ticket_balances.read(caller);
-            assert(current_balance == 0, 7);
-            self.mint_ticket(caller);
-        } else if event_type == 2 || event_type == 3 {
-            let mut erc20_address = self.erc20_address.read();
-            let caller_balance = IERC20::balance_of(@erc20_address, caller);
-            assert(caller_balance >= self.ticket_price.read(), 8);
-            let current_balance = self.ticket_balances.read(caller);
-            assert(current_balance == 0, 7);
-            let allowed_amount = IERC20::allowance(@erc20_address, caller, starknet::get_contract_address());
-            assert(allowed_amount >= self.ticket_price.read(), 9); // Error code 9: Insufficient allowance
-            IERC20::transferFrom(ref erc20_address, caller, self.ownable.owner(), self.ticket_price.read());
-            self.mint_ticket(caller);
+        match ticket_type {
+            EventType::Free => {
+                self.mint_ticket(caller);
+            },
+            EventType::Refundable | EventType::Paid => {
+                let mut erc20_address = self.erc20_address.read();
+                let caller_balance = IERC20::balance_of(@erc20_address, caller);
+                assert(caller_balance >= self.ticket_price.read(), 'Insufficient balance');
+                let allowed_amount = IERC20::allowance(@erc20_address, caller, starknet::get_contract_address());
+                assert(allowed_amount >= self.ticket_price.read(), 'Insufficient allowance');
+                IERC20::transferFrom(ref erc20_address, caller, self.ownable.owner(), self.ticket_price.read());
+                self.mint_ticket(caller);
+            },
         }
+    }
+
+    #[external(v0)]
+    fn get_ticket_type_felt252(self: @ContractState) -> felt252 {
+        match self.ticket_type.read() {
+            EventType::Free => 'free',
+            EventType::Refundable => 'refundable',
+            EventType::Paid => 'paid',
+        }
+    }
+
+    #[external(v0)]
+    fn get_ticket_type_enum(self: @ContractState) -> EventType {
+        self.ticket_type.read()
     }
 
     #[external(v0)]
     fn refund(ref self: ContractState) {
         let caller = get_caller_address();
-        let event_type = self.event_type.read();
-        if event_type == 2 {
+        let ticket_type = self.ticket_type.read();
 
-        }
+        match ticket_type {
+		        EventType::Refundable => {
+		            // TODO: return money after event ends
+		        },
+		        EventType::Free | EventType::Paid => {
+               let mut error_msg = ArrayTrait::new();
+                error_msg.append('Cannot refund this event');
+                panic(error_msg)
+		        }
+		    }
         let mut array: Array<felt252> = ArrayTrait::new();
         let span = array.span();
-    }
-
-    fn u8_to_event_type(value: u8) -> EventType {
-        match value {
-            0 => EventType::free,
-            1 => EventType::refundable,
-            2 => EventType::paid,
-            _ => panic!("Invalid value for EventType"),
-        }
     }
 
     #[external(v0)]
@@ -268,25 +294,25 @@ mod ERC1155EventTicket {
         self.erc1155.set_approval_for_all(caller, true);
 
         // List the token
-        self.listed_tokens.write(caller, (token_id, price));
+        self.ticket_listings.write(caller, (token_id, price));
     }
 
     #[external(v0)]
     fn delist(ref self: ContractState, token_id: u256) {
         let caller = get_caller_address();
         // Check if the token is listed
-        let (listed_token_id, _) = self.listed_tokens.read(caller);
+        let (listed_token_id, _) = self.ticket_listings.read(caller);
         assert(listed_token_id == token_id, 3); // Error code 3: Token not listed or not owned by caller
 
         // Delist the token
-        self.listed_tokens.write(caller, (0, 0)); // Reset the listing
+        self.ticket_listings.write(caller, (0, 0)); // Reset the listing
     }
 
     #[external(v0)]
     fn buy(ref self: ContractState, seller: ContractAddress, token_id: u256, mut erc20_address: ContractAddress) {
         let buyer = get_caller_address();
         // Check if the token is listed
-        let (listed_token_id, price) = self.listed_tokens.read(seller);
+        let (listed_token_id, price) = self.ticket_listings.read(seller);
         assert(listed_token_id == token_id, 3); // Error code 3: Token not listed or incorrect token ID
 
         // Calculate the royalties amount
@@ -316,14 +342,7 @@ mod ERC1155EventTicket {
         self.erc1155.safe_transfer_from(seller, buyer, token_id, 1, ArrayTrait::new().span());
 
         // Delist the token
-        self.listed_tokens.write(seller, (0, 0)); // Reset the listing
-    }
-
-    #[external(v0)]
-    fn get_event_type(self: @ContractState) -> u8 {
-        let value = self.event_type.read();
-        // 1 - free, 2 - refundable, 3 - paid
-        value
+        self.ticket_listings.write(seller, (0, 0)); // Reset the listing
     }
 
     #[external(v0)]
@@ -337,28 +356,13 @@ mod ERC1155EventTicket {
     }
 
     #[external(v0)]
-    fn get_total_supply(self: @ContractState) -> u256 {
-        self.total_supply.read()
-    }
-
-    #[external(v0)]
-    fn get_seller(self: @ContractState) -> ContractAddress {
-        self.seller.read()
-    }
-
-    #[external(v0)]
-    fn get_contract_balance(self: @ContractState) -> u256 {
-        self.contract_balance.read()
+    fn get_ticket_supply(self: @ContractState) -> u256 {
+        self.ticket_supply.read()
     }
 
     #[external(v0)]
     fn get_royalties(self: @ContractState) -> u8 {
         self.royalties.read()
-    }
-
-    #[external(v0)]
-    fn get_caller_balance(self: @ContractState) -> u256 {
-        self.ticket_balances.read(get_caller_address())
     }
 
     #[external(v0)]
