@@ -241,21 +241,27 @@ mod ERC1155EventTicket {
 
     #[external(v0)]
     fn refund(ref self: ContractState) {
-        let caller = get_caller_address();
         let ticket_type = self.ticket_type.read();
-
         match ticket_type {
-		        EventType::Refundable => {
-		            // TODO: return money after event ends
-		        },
-		        EventType::Free | EventType::Paid => {
+            EventType::Refundable => {
+                assert(get_block_timestamp() > self.event_end.read(), 'Event has not ended yet');
+	                  let caller = get_caller_address();
+	                  let ticket_balance = self.ticket_balances.read(caller);
+	                  assert(ticket_balance > 0, 'No ticket to refund');
+
+	                  let ticket_price = self.ticket_price.read();
+	                  let mut erc20_address = self.erc20_address.read();
+
+	                  IERC20::transferFrom(ref erc20_address, self.ownable.owner(), caller, ticket_price);
+	                  // Emit a refund event (you'll need to define this event)
+	                  // self.emit(RefundEvent { user: caller, amount: ticket_price });
+            },
+            EventType::Free | EventType::Paid => {
                let mut error_msg = ArrayTrait::new();
                 error_msg.append('Cannot refund this event');
                 panic(error_msg)
-		        }
-		    }
-        let mut array: Array<felt252> = ArrayTrait::new();
-        let span = array.span();
+            }
+        }
     }
 
     #[external(v0)]
