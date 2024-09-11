@@ -91,18 +91,32 @@ mod ERC1155EventTicket {
         ownable: OwnableComponent::Storage,
     }
 
-		#[derive(Copy, Drop, Serde, starknet::Store, PartialEq)]
-		 enum EventType {
-		     Free,
-		     Refundable,
-		     Paid,
-		 }
+    #[derive(Copy, Drop, Serde, starknet::Store, PartialEq)]
+    enum EventType {
+        Free,
+        Refundable,
+        Paid,
+    }
 
     #[derive(Drop)]
     struct Listing {
         token_id: u256,
         price: u256,
         is_active: bool,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    struct TicketPurchase {
+        buyer: ContractAddress,
+        price: u256,
+        token_id: u256,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    struct TicketRefund {
+        buyer: ContractAddress,
+        price: u256,
+        token_id: u256,
     }
 
     #[event]
@@ -116,6 +130,8 @@ mod ERC1155EventTicket {
         PausableEvent: PausableComponent::Event,
         #[flat]
         OwnableEvent: OwnableComponent::Event,
+        TicketPurchase: TicketPurchase,
+        TicketRefund: TicketRefund,
     }
 
     #[constructor]
@@ -181,10 +197,15 @@ mod ERC1155EventTicket {
         }
 
         fn mint_ticket(ref self: ContractState, recipient: ContractAddress) {
-            self.ticket_balances.write(recipient, 1);
             let current_token_id = self.next_token_id.read();
+            self.ticket_balances.write(recipient, current_token_id);
             self.mint(recipient, current_token_id, 1, ArrayTrait::new().span());
             self.next_token_id.write(current_token_id + 1);
+            self.emit(TicketPurchase { 
+                buyer: recipient, 
+                price: self.ticket_price.read(), 
+                token_id: current_token_id
+            });
         }
 
         #[external(v0)]
@@ -211,12 +232,12 @@ mod ERC1155EventTicket {
         }
     }
 
-		#[external(v0)]
+    #[external(v0)]
     fn get_ticket(ref self: ContractState) {
         let caller = get_caller_address();
         let ticket_type = self.ticket_type.read();
-        let current_balance = self.ticket_balances.read(caller);
-        assert(current_balance == 0, 'Already has a ticket');
+        let caller_owned_token_id = self.ticket_balances.read(caller);
+        assert(caller_owned_token_id == 0, 'You already have a ticket');
 
         match ticket_type {
             EventType::Free => {
@@ -255,15 +276,18 @@ mod ERC1155EventTicket {
             EventType::Refundable => {
                 // assert(get_block_timestamp() > self.event_end.read(), 'Event has not ended yet');
                 let caller = get_caller_address();
-                let ticket_balance = self.ticket_balances.read(caller);
-                assert(ticket_balance > 0, 'No ticket to refund');
+                let ticket_id_of_caller = self.ticket_balances.read(caller);
+                assert(ticket_id_of_caller > 0, 'No ticket to refund');
 
                 let ticket_price = self.ticket_price.read();
                 let mut erc20_address = self.erc20_address.read();
 
                 IERC20::transferFrom(ref erc20_address, starknet::get_contract_address(), caller, ticket_price);
-                // Emit a refund event (you'll need to define this event)
-                // self.emit(RefundEvent { user: caller, amount: ticket_price });
+                self.emit(TicketRefund { 
+                    buyer: get_caller_address(), 
+                    price: self.ticket_price.read(), 
+                    token_id: ticket_id_of_caller
+                });
             },
             EventType::Free | EventType::Paid => {
                let mut error_msg = ArrayTrait::new();
