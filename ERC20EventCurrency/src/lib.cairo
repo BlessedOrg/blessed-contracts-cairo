@@ -57,6 +57,7 @@ mod ERC20EventCurrency {
         self.erc20.initializer(name, symbol);
         self.ownable.initializer(owner);
         self.erc20.mint(owner, supply);
+        // TODO: approve owner to spend?
     }
 
     #[abi(embed_v0)]
