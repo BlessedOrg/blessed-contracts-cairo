@@ -30,6 +30,7 @@ mod ERC1155EventTicket {
     use starknet::ContractAddress;
     use starknet::get_caller_address;
     use starknet::get_block_timestamp;
+    use starknet::syscalls::call_contract_syscall;
 
     component!(path: ERC1155Component, storage: erc1155, event: ERC1155Event);
     component!(path: SRC5Component, storage: src5, event: SRC5Event);
@@ -119,6 +120,27 @@ mod ERC1155EventTicket {
         token_id: u256,
     }
 
+    #[derive(Drop, starknet::Event)]
+    struct TokenListed {
+        seller: ContractAddress,
+        token_id: u256,
+        price: u256,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    struct TokenDelisted {
+        seller: ContractAddress,
+        token_id: u256,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    struct TokenFromListingPurchase {
+        buyer: ContractAddress,
+        seller: ContractAddress,
+        token_id: u256,
+        price: u256,
+    }
+
     #[event]
     #[derive(Drop, starknet::Event)]
     enum Event {
@@ -132,6 +154,9 @@ mod ERC1155EventTicket {
         OwnableEvent: OwnableComponent::Event,
         TicketPurchase: TicketPurchase,
         TicketRefund: TicketRefund,
+        TokenListed: TokenListed,
+        TokenDelisted: TokenDelisted,
+        TokenFromListingPurchase: TokenFromListingPurchase
     }
 
     #[constructor]
@@ -146,7 +171,7 @@ mod ERC1155EventTicket {
         event_start: u64,
         event_end: u64,
     ) {
-        assert(1 <= royalties && royalties <= 99, 4); // Error code 4: Invalid royalties percentage
+        assert(1 <= royalties && royalties <= 99, 'must be between 1 and 99');
         assert(event_start > get_block_timestamp(), 'event_start < now');
         assert(event_end > event_start, 'event_end < event_start');
 
@@ -180,6 +205,10 @@ mod ERC1155EventTicket {
             starknet::get_contract_address(),
             total_approval_amount
         );
+
+        // 🏗️ TODO: delete this ⬇️ it's for simpler testing
+        // self.mint_ticket(owner);
+        // self.mint_ticket(starknet::contract_address_const::<0x0384753535a8f4febe864e07d6c2bf0ea7be049cfaa1c5ebe9106b467b406a8e>());
     }
 
     #[generate_trait]
@@ -326,62 +355,82 @@ mod ERC1155EventTicket {
     #[external(v0)]
     fn list(ref self: ContractState, token_id: u256, price: u256) {
         let caller = get_caller_address();
-        // Check if the caller owns the token
-        assert(self.erc1155.balance_of(caller, token_id) > 0, 2); // Error code 2: Not the token owner
+        assert(self.erc1155.balance_of(caller, token_id) > 0, 'Not the token owner');
+        let (listed_token_id, _) = self.ticket_listings.read(caller);
+        assert(listed_token_id == 0, 'Token already listed');
+        assert(price > 0, 'Price must be greater than zero');
+        assert(get_block_timestamp() < self.event_start.read(), 'Event has already started');
 
-        // Approve the contract to transfer the token
-        self.erc1155.set_approval_for_all(caller, true);
-
-        // List the token
+        self.erc1155.set_approval_for_all(starknet::get_contract_address(), true);
         self.ticket_listings.write(caller, (token_id, price));
+        self.emit(TokenListed { seller: caller, token_id: token_id, price: price });
     }
 
     #[external(v0)]
     fn delist(ref self: ContractState, token_id: u256) {
         let caller = get_caller_address();
-        // Check if the token is listed
         let (listed_token_id, _) = self.ticket_listings.read(caller);
-        assert(listed_token_id == token_id, 3); // Error code 3: Token not listed or not owned by caller
+        assert(listed_token_id == token_id, 'Token not listed ');
 
-        // Delist the token
         self.ticket_listings.write(caller, (0, 0)); // Reset the listing
+        self.erc1155.set_approval_for_all(starknet::get_contract_address(), false);
+        self.emit(TokenDelisted { seller: caller, token_id: token_id });
     }
 
     #[external(v0)]
-    fn buy(ref self: ContractState, seller: ContractAddress, token_id: u256, mut erc20_address: ContractAddress) {
+    fn buy(ref self: ContractState, seller: ContractAddress, token_id: u256) {
+        // before calling this, user needs to approve this contract to spend their ERC20 tokens
         let buyer = get_caller_address();
-        // Check if the token is listed
         let (listed_token_id, price) = self.ticket_listings.read(seller);
-        assert(listed_token_id == token_id, 3); // Error code 3: Token not listed or incorrect token ID
-
-        // Calculate the royalties amount
-        let royalties_percentage = self.royalties.read();
-        let royalties_amount = (price * royalties_percentage.into()) / 100_u256;
-
-        // 🏗️ TODO: move it to the seperate function to safely call transferFrom | Approve the
-        // contract to spend the buyer's tokens IERC20::approve(ref erc20_address,
-        // starknet::get_contract_address(), price);
-
-        // Transfer the token price from the buyer to the contract
-        IERC20::transferFrom(ref erc20_address, buyer, seller, price);
-
+        assert(listed_token_id == token_id, 'Token not listed');
+        assert(buyer != seller, 'Cannot buy your own token');
+        assert(get_block_timestamp() < self.event_start.read(), 'Event has already started');
+        
+        // Check buyer's balance and allowance
+        let mut erc20_address = self.erc20_address.read();
+        let buyer_balance = IERC20::balance_of(@erc20_address, buyer);
+        assert(buyer_balance >= price, 'Insufficient balance of ERC20');
+        let allowed_amount = IERC20::allowance(@erc20_address, buyer, starknet::get_contract_address());
+        assert(allowed_amount >= price, 'Insufficient allowance of ERC20');
+        
+        // Transfer the full price from the buyer to this contract
+        IERC20::transferFrom(ref erc20_address, buyer, starknet::get_contract_address(), price);
+        
         // Transfer the royalties to the contract owner
         let owner = self.ownable.owner();
-        IERC20::transferFrom(
-            ref erc20_address, starknet::get_contract_address(), owner, royalties_amount
-        );
+        let royalties_amount = (price * self.royalties.read().into()) / 100_u256;
+        IERC20::transferFrom(ref erc20_address, starknet::get_contract_address(), owner, royalties_amount);
 
         // Transfer the remaining amount to the seller
         let seller_amount = price - royalties_amount;
-        IERC20::transferFrom(
-            ref erc20_address, starknet::get_contract_address(), seller, seller_amount
-        );
+        IERC20::transferFrom(ref erc20_address, starknet::get_contract_address(), seller, seller_amount);
 
         // Transfer the token to the buyer
-        self.erc1155.safe_transfer_from(seller, buyer, token_id, 1, ArrayTrait::new().span());
+        // Replace the direct call with a low-level call
+        let contract_address = starknet::get_contract_address();
+        let calldata = array![
+            seller.into(),
+            buyer.into(),
+            token_id.low.into(),
+            token_id.high.into(),
+            1.into(),
+            0.into(),
+            0.into(), // data length (empty array)
+        ];
+        let result = starknet::syscalls::call_contract_syscall(
+            contract_address,
+            selector!("safeTransferFrom"),
+            calldata.span()
+        ).unwrap();
+        assert(result.len() == 0, 'Transfer failed');
+        // self.erc1155.safe_transfer_from(seller, buyer, token_id, 1, ArrayTrait::new().span());
 
-        // Delist the token
+        self.ticket_balances.write(seller, 0);
+        self.ticket_balances.write(buyer, token_id);
+
         self.ticket_listings.write(seller, (0, 0)); // Reset the listing
+
+        self.emit(TokenFromListingPurchase { buyer, seller, token_id, price });
     }
 
     #[external(v0)]
@@ -405,8 +454,13 @@ mod ERC1155EventTicket {
     }
 
     #[external(v0)]
-    fn get_wallet_balance(self: @ContractState, wallet: ContractAddress) -> u256 {
+    fn get_wallet_token_id(self: @ContractState, wallet: ContractAddress) -> u256 {
         self.ticket_balances.read(wallet)
     }
-    // add getter for specified listing
+
+    #[external(v0)]
+    fn get_listing_of_wallet(self: @ContractState, wallet: ContractAddress) -> (u256, u256) {
+        let (token_id, price) = self.ticket_listings.read(wallet);
+        (token_id, price)
+    }
 }
