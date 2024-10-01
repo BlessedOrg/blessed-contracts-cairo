@@ -6,7 +6,7 @@
 #    $we_are_here  blessed-dashboard
 
 # Base directories
-app_artifacts_dir="../blessed-dashboard/src/contracts/artifacts"
+app_artifacts_dir="../blessed-api/src/contracts/artifacts"
 
 # Loop through each folder in the blessed-cairo-contracts directory
 for dir in */; do
@@ -28,8 +28,10 @@ for dir in */; do
 
     # Copy the found JSON file to the artifacts directory with the new name
     new_file_path="$app_artifacts_dir/${contract_name}.json"
+    echo "🗃️ JSON_FILE IS: $json_file"
+    echo "🛣️ NEW_FILE_ATH IS: $new_file_path"
     cp "$json_file" "$new_file_path"
-    echo "📝 Copied to: $new_file_path"
+    echo "✅ Copied to: $new_file_path"
 done
 
 echo "________________________"

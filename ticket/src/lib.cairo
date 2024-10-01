@@ -82,6 +82,9 @@ mod ERC1155EventTicket {
         pub next_token_id: u256,
         pub event_start: u64,
         pub event_end: u64,
+        pub royalties_map: LegacyMap<ContractAddress, u8>,
+        pub royalties_receivers: LegacyMap<u32, ContractAddress>,
+        pub royalties_receivers_count: u32,
         #[substorage(v0)]
         erc1155: ERC1155Component::Storage,
         #[substorage(v0)]
@@ -165,18 +168,17 @@ mod ERC1155EventTicket {
         owner: ContractAddress,
         ticket_price: u256,
         ticket_supply: u256,
-        royalties: u8,
+        royalties_receivers: Array<(ContractAddress, u8)>,
         erc20_address: ContractAddress,
         ticket_type: felt252,
         event_start: u64,
         event_end: u64,
     ) {
-        assert(1 <= royalties && royalties <= 99, 'must be between 1 and 99');
         assert(event_start > get_block_timestamp(), 'event_start < now');
         assert(event_end > event_start, 'event_end < event_start');
-
-        let ticket_type_value =
-        if ticket_type == 'free' {
+        assert(royalties_receivers.len() == 0 || ticket_price > 10_u256, 'Price must be > 10 if royalties');
+        
+        let ticket_type_value = if ticket_type == 'free' {
             EventType::Free
         } else if ticket_type == 'refundable' {
             EventType::Refundable
@@ -187,29 +189,69 @@ mod ERC1155EventTicket {
             error_msg.append('free | refundable | paid');
             panic(error_msg)
         };
+
         self.ticket_type.write(ticket_type_value);
         self.event_start.write(event_start);
         self.event_end.write(event_end);
         self.next_token_id.write(1);
         self.ticket_price.write(ticket_price);
         self.ticket_supply.write(ticket_supply);
-        self.royalties.write(royalties);
-        self.erc20_address.write(erc20_address);
+
+        let mut total_royalties: u8 = 0;
+        let mut count: u32 = 0;
+        let mut royalties_receivers = royalties_receivers;
+        loop {
+            match royalties_receivers.pop_front() {
+                Option::Some((address, percentage)) => {
+                    total_royalties += percentage;
+                    assert(total_royalties <= 99, 'Total royalties must be <= 99%');
+                    self.royalties_map.write(address, percentage);
+                    self.royalties_receivers.write(count, address);
+                    count += 1;
+                },
+                Option::None => { break; },
+            };
+        };
+        self.royalties_receivers_count.write(count);
+
         self.erc1155.initializer("");
         self.ownable.initializer(owner);
 
-        let total_approval_amount = self.ticket_price.read() * self.ticket_supply.read();
-        let mut erc20_address = self.erc20_address.read();
-        IERC20::approve(
-            ref erc20_address,
-            starknet::get_contract_address(),
-            total_approval_amount
-        );
-
+        if ticket_type_value != EventType::Free {
+            self.erc20_address.write(erc20_address);
+            let total_approval_amount = self.ticket_price.read() * self.ticket_supply.read();
+            let mut erc20_address = self.erc20_address.read();
+            IERC20::approve(
+                ref erc20_address,
+                starknet::get_contract_address(),
+                total_approval_amount
+            );
+        }
         // 🏗️ TODO: delete this ⬇️ it's for simpler testing
         // self.mint_ticket(owner);
         // self.mint_ticket(starknet::contract_address_const::<0x0384753535a8f4febe864e07d6c2bf0ea7be049cfaa1c5ebe9106b467b406a8e>());
     }
+
+    // 🏗️ TODO: probably this will be for delete
+    // #[external(v0)]
+    // fn set_royalties(ref self: ContractState, royalties_receivers: Array<(ContractAddress, u8)>) {
+    //     let mut total_royalties: u8 = 0;
+    //     let mut count: u32 = 0;
+    //     let mut royalties_receivers = royalties_receivers;
+    //     loop {
+    //         match royalties_receivers.pop_front() {
+    //             Option::Some((address, percentage)) => {
+    //                 total_royalties += percentage;
+    //                 assert(total_royalties <= 99, 'Total royalties must be <= 99%');
+    //                 self.royalties_map.write(address, percentage);
+    //                 self.royalties_receivers.write(count, address);
+    //                 count += 1;
+    //             },
+    //             Option::None => { break; },
+    //         };
+    //     };
+    //     self.royalties_receivers_count.write(count);
+    // }
 
     #[generate_trait]
     #[abi(per_item)]
@@ -262,26 +304,61 @@ mod ERC1155EventTicket {
     }
 
     #[external(v0)]
-    fn get_ticket(ref self: ContractState) {
+    fn get(ref self: ContractState) {
         let caller = get_caller_address();
         let ticket_type = self.ticket_type.read();
         let caller_owned_token_id = self.ticket_balances.read(caller);
         assert(caller_owned_token_id == 0, 'You already have a ticket');
-
+        
         match ticket_type {
             EventType::Free => {
                 self.mint_ticket(caller);
             },
-            EventType::Refundable | EventType::Paid => {
+            EventType::Refundable => {
                 let mut erc20_address = self.erc20_address.read();
                 let caller_balance = IERC20::balance_of(@erc20_address, caller);
                 assert(caller_balance >= self.ticket_price.read(), 'Insufficient balance');
                 let allowed_amount = IERC20::allowance(@erc20_address, caller, starknet::get_contract_address());
                 assert(allowed_amount >= self.ticket_price.read(), 'Insufficient allowance');
+                
                 IERC20::transferFrom(ref erc20_address, caller, starknet::get_contract_address(), self.ticket_price.read());
                 self.mint_ticket(caller);
             },
+            EventType::Paid => {
+                let mut erc20_address = self.erc20_address.read();
+                let mut remaining_amount = self.ticket_price.read();
+                let receivers_count = self.royalties_receivers_count.read();
+
+                let mut i: u32 = 0;
+                loop {
+                    if i >= receivers_count {
+                        break;
+                    }
+                    let receiver = self.royalties_receivers.read(i);
+                    let royalty_percentage = self.royalties_map.read(receiver);
+                    let royalty_amount = (self.ticket_price.read() * royalty_percentage.into()) / 100_u256;
+                    if royalty_amount > 0 {
+                        IERC20::transferFrom(ref erc20_address, caller, receiver, royalty_amount);
+                        remaining_amount -= royalty_amount;
+                    }
+                    i += 1;
+                };
+
+                // Transfer remaining amount to owner
+                if remaining_amount > 0 {
+                    let owner = self.ownable.owner();
+                    IERC20::transferFrom(ref erc20_address, caller, owner, remaining_amount);
+                }
+
+                self.mint_ticket(caller);
+            }
         }
+    }
+
+    #[external(v0)]
+    fn send(ref self: ContractState, to: ContractAddress) {
+        self.ownable.assert_only_owner();
+        self.mint_ticket(to)
     }
 
     #[external(v0)]
@@ -354,6 +431,8 @@ mod ERC1155EventTicket {
 
     #[external(v0)]
     fn list(ref self: ContractState, token_id: u256, price: u256) {
+        assert(self.ticket_type.read() != EventType::Free, 'Not available for free tickets');
+
         let caller = get_caller_address();
         assert(self.erc1155.balance_of(caller, token_id) > 0, 'Not the token owner');
         let (listed_token_id, _) = self.ticket_listings.read(caller);
@@ -368,6 +447,8 @@ mod ERC1155EventTicket {
 
     #[external(v0)]
     fn delist(ref self: ContractState, token_id: u256) {
+        assert(self.ticket_type.read() != EventType::Free, 'Not available for free tickets');
+
         let caller = get_caller_address();
         let (listed_token_id, _) = self.ticket_listings.read(caller);
         assert(listed_token_id == token_id, 'Token not listed ');
@@ -379,6 +460,8 @@ mod ERC1155EventTicket {
 
     #[external(v0)]
     fn buy(ref self: ContractState, seller: ContractAddress, token_id: u256) {
+        assert(self.ticket_type.read() != EventType::Free, 'Not available for free tickets');
+
         // before calling this, user needs to approve this contract to spend their ERC20 tokens
         let buyer = get_caller_address();
         let (listed_token_id, price) = self.ticket_listings.read(seller);
@@ -439,18 +522,13 @@ mod ERC1155EventTicket {
     }
 
     #[external(v0)]
-    fn get_ticket_price(self: @ContractState) -> u256 {
+        fn get_ticket_price(self: @ContractState) -> u256 {
         self.ticket_price.read()
     }
 
     #[external(v0)]
     fn get_ticket_supply(self: @ContractState) -> u256 {
         self.ticket_supply.read()
-    }
-
-    #[external(v0)]
-    fn get_royalties(self: @ContractState) -> u8 {
-        self.royalties.read()
     }
 
     #[external(v0)]
@@ -462,5 +540,22 @@ mod ERC1155EventTicket {
     fn get_listing_of_wallet(self: @ContractState, wallet: ContractAddress) -> (u256, u256) {
         let (token_id, price) = self.ticket_listings.read(wallet);
         (token_id, price)
+    }
+
+    #[external(v0)]
+    fn get_royalties(self: @ContractState) -> Array<(ContractAddress, u8)> {
+        let mut result = ArrayTrait::new();
+        let receivers_count = self.royalties_receivers_count.read();
+        let mut i: u32 = 0;
+        loop {
+            if i >= receivers_count {
+                break;
+            }
+            let receiver = self.royalties_receivers.read(i);
+            let percentage = self.royalties_map.read(receiver);
+            result.append((receiver, percentage));
+            i += 1;
+        };
+        result
     }
 }
